@@ -11,6 +11,7 @@ Commands:
   php       check the local PHP install against known 2026 CVEs
   web       website fortress (audit a site / run the reverse-proxy WAF)
   net       self network audit (listening services)
+  repo      supply-chain scan of a GitHub repo or local dir
 """
 import argparse
 import http.server
@@ -169,6 +170,37 @@ DANGEROUS_SERVICES = {
     27017: "mongodb", 5432: "postgresql", 2375: "docker (unauthenticated)",
     11211: "memcached", 5900: "vnc", 3389: "rdp", 22: "ssh", 5985: "winrm",
 }
+
+# --- Supply-chain / malicious-repo detection ---
+SUPPLY_CHAIN = [
+    (re.compile(r"(discord(app)?\.com/api/webhooks|hooks\.slack\.com/services|api\.telegram\.org/bot)"), "webhook exfiltration endpoint", "high"),
+    (re.compile(r"(eval|exec|system|os\.system|subprocess|child_process)\(\s*(atob|Buffer\.from|base64|b64decode|unhexlify|fromhex|bytes\.fromhex)"), "obfuscated eval/exec", "high"),
+    (re.compile(r"curl[^\n]*\|\s*(sh|bash|zsh)|wget[^\n]*\|\s*(sh|bash|zsh)"), "download-and-execute", "high"),
+    (re.compile(r"/dev/tcp/|nc\s+-e\s|ncat\s+-e\s|bash\s+-i\s*>&|sh\s+-i\s*>&"), "reverse shell", "high"),
+    (re.compile(r"(xmrig|cpuminer|xmr-stak|stratum\+tcp|pool\.minexmr|nanopool)"), "crypto miner", "high"),
+    (re.compile(r"(wallet\.dat|metamask|seed\s*phrase|mnemonic|private\s*key).{0,60}(upload|send|post|fetch|exfil|webhook)"), "wallet/credential theft", "high"),
+    (re.compile(r"(authorized_keys|crontab|launchctl|LaunchAgent|LaunchDaemon|systemctl\s+enable|schtasks)"), "persistence mechanism", "medium"),
+    (re.compile(r"(chmod\s+\+s|chmod\s+4777|setuid|SetUID)"), "setuid escalation", "medium"),
+    (re.compile(r"[A-Za-z0-9+/]{80,}={0,2}"), "long base64 blob (possible payload)", "medium"),
+    (re.compile(r"(?:\\x[0-9a-fA-F]{2}){30,}"), "hex-encoded blob", "medium"),
+    (re.compile(r"https?://\d{1,3}(?:\.\d{1,3}){3}"), "direct IP URL", "low"),
+    (re.compile(r"(process\.env\.|\.env).{0,40}(webhook|fetch|axios|requests|post|curl)"), "env var exfiltration", "high"),
+    (re.compile(r"(ssh-rsa|ssh-ed25519|ecdsa-)[A-Za-z0-9+/=]{40,}"), "embedded SSH key", "medium"),
+]
+
+CODE_EXTENSIONS = {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".py", ".sh", ".bash",
+                  ".php", ".rb", ".go", ".rs", ".sol", ".pl", ".ex", ".exs", ".java",
+                  ".kt", ".cs", ".ps1", ".zsh"}
+
+SKIP_PARTS = ["node_modules", ".git", "vendor", "dist", ".next", "__pycache__", ".venv", "site-packages", "min.js"]
+
+POPULAR_PACKAGES = ["react", "react-dom", "lodash", "axios", "express", "next", "vue",
+                    "requests", "numpy", "pandas", "flask", "django", "torch",
+                    "tensorflow", "web3", "ethers", "viem", "solana-web3", "openai",
+                    "anthropic", "langchain", "vite", "webpack", "typescript", "eslint",
+                    "prettier", "dotenv", "crypto-js", "mysql2", "pg", "mongoose",
+                    "prisma", "tailwindcss", "three", "playwright", "puppeteer",
+                    "jest", "mocha", "chai", "fastapi", "uvicorn", "aiohttp", "pillow"]
 
 
 def _run(cmd, timeout=15):
@@ -587,6 +619,109 @@ def net_audit():
     return {"listening": len(out.splitlines()), "dangerous_services": hits}
 
 
+def _lev(a, b):
+    """Levenshtein edit distance."""
+    la, lb = len(a), len(b)
+    if la > lb:
+        a, b, la, lb = b, a, lb, la
+    prev = list(range(lb + 1))
+    for i in range(1, la + 1):
+        cur = [i] + [0] * lb
+        for j in range(1, lb + 1):
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] != b[j - 1]))
+        prev = cur
+    return prev[lb]
+
+
+def repo_scan(target):
+    """Scan a GitHub URL or local directory for malicious supply-chain code."""
+    import shutil as _sh
+    import tempfile
+    findings = []
+    tmp = None
+    root = target
+    if target.startswith(("http://", "https://", "git@", "ssh://")):
+        tmp = tempfile.mkdtemp(prefix="vanguard-repo-")
+        out, err, rc = _run(f"git clone --depth 1 --quiet '{target}' '{tmp}'", timeout=120)
+        if rc != 0:
+            return {"target": target, "verdict": "error", "error": f"clone failed: {err.strip()[:200]}"}
+        root = tmp
+
+    name = Path(root).name.lower().replace(".git", "").replace("-", "").replace("_", "")
+    name_hits = []
+    for pkg in POPULAR_PACKAGES:
+        pn = pkg.replace("-", "").replace("_", "")
+        if name == pn:
+            name_hits = []
+            break
+        if len(name) >= 4 and _lev(name, pn) <= 1:
+            name_hits.append(pkg)
+
+    try:
+        for p in Path(root).rglob("*"):
+            if p.is_dir():
+                continue
+            sp = str(p)
+            if any(s in sp for s in SKIP_PARTS):
+                continue
+            if p.suffix.lower() not in CODE_EXTENSIONS and p.name not in (
+                "package.json", "setup.py", "pyproject.toml", "requirements.txt",
+                "Cargo.toml", "go.mod", "Makefile", "Dockerfile"):
+                continue
+            try:
+                if p.stat().st_size > 2_000_000:
+                    continue
+                txt = p.read_text(errors="ignore")
+            except Exception:
+                continue
+            for pat, label, sev in SUPPLY_CHAIN:
+                m = pat.search(txt)
+                if m:
+                    line = txt[:m.start()].count("\n") + 1
+                    findings.append({"file": sp[len(str(root)) + 1:], "line": line, "what": label, "severity": sev})
+            if p.name == "package.json":
+                try:
+                    j = json.loads(txt)
+                    for hook in ("preinstall", "postinstall", "install"):
+                        cmd = j.get("scripts", {}).get(hook, "")
+                        if re.search(r"curl|wget|\bsh\b|\bbash\b|node\s+-e|python\s+-c|\beval\b", cmd, re.I):
+                            findings.append({"file": p.name, "line": 0, "what": f"{hook} hook runs: {cmd[:80]}", "severity": "high"})
+                except Exception:
+                    pass
+            if p.name in ("package.json", "requirements.txt"):
+                deps = []
+                if p.name == "package.json":
+                    try:
+                        j = json.loads(txt)
+                        deps = list(j.get("dependencies", {}).keys()) + list(j.get("devDependencies", {}).keys())
+                    except Exception:
+                        pass
+                else:
+                    for ln in txt.splitlines():
+                        m2 = re.match(r"\s*([A-Za-z0-9._-]+)", ln)
+                        if m2:
+                            deps.append(m2.group(1))
+                for d in deps:
+                    dn = d.lower().replace("-", "").replace("_", "")
+                    for pkg in POPULAR_PACKAGES:
+                        pn = pkg.replace("-", "").replace("_", "")
+                        if dn != pn and len(dn) >= 4 and _lev(dn, pn) <= 1:
+                            findings.append({"file": p.name, "line": 0, "what": f"possible typosquat: '{d}' ~ '{pkg}'", "severity": "low"})
+                            break
+    finally:
+        if tmp:
+            _sh.rmtree(tmp, ignore_errors=True)
+
+    verdict = "clean"
+    if any(f["severity"] == "high" for f in findings):
+        verdict = "MALICIOUS"
+    elif findings:
+        verdict = "suspicious"
+    if name_hits:
+        findings.append({"file": "(repo name)", "line": 0, "what": f"name close to '{name_hits[0]}'", "severity": "low"})
+    return {"target": target, "verdict": verdict, "total": len(findings), "findings": findings}
+
+
 # ----------------------------------------------------------------------------
 # CLI
 # ----------------------------------------------------------------------------
@@ -622,6 +757,9 @@ def main():
 
     sub.add_parser("net", help="self network audit (listening services)")
 
+    rp = sub.add_parser("repo", help="supply-chain scan of a GitHub repo or local dir")
+    rp.add_argument("target")
+
     args = p.parse_args()
 
     if args.cmd == "scan":
@@ -652,6 +790,8 @@ def main():
             web_shield(args.upstream, args.port)
     elif args.cmd == "net":
         print(json.dumps(net_audit(), indent=2))
+    elif args.cmd == "repo":
+        print(json.dumps(repo_scan(args.target), indent=2))
 
 
 if __name__ == "__main__":

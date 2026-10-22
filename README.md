@@ -46,6 +46,7 @@ python3 vanguard.py php           # check local PHP against the 2026 CVEs
 python3 vanguard.py web audit URL # audit a website's security posture
 python3 vanguard.py web shield URL # run the reverse-proxy WAF in front of a site
 python3 vanguard.py net           # self network audit (listening services)
+python3 vanguard.py repo URL      # scan a repo for malware before you clone it
 ```
 
 No `pip install`. No compiled deps. Python 3.8+ only.
@@ -66,6 +67,7 @@ No `pip install`. No compiled deps. Python 3.8+ only.
 | **Web attacks** | The shield blocks SQLi, XSS, path traversal, SSTI, command injection, PHP wrappers and object injection at the door, before they reach your app |
 | **Website posture** | `web audit` checks security headers, TLS, server disclosure, and exposed sensitive paths (/.git, /.env, phpinfo, backups) |
 | **Network exposure** | `net` lists what is listening and flags dangerous open services (redis, mongo, docker, vnc, telnet, …) |
+| **Supply chain** | `repo` scans any GitHub URL or local dir for obfuscation, backdoors, reverse shells, exfiltration webhooks, malicious install hooks and typosquatted dependencies — before you clone or install it |
 
 ## Commands
 
@@ -149,6 +151,31 @@ without auth, vnc, telnet, …).
 ```bash
 python3 vanguard.py net
 ```
+
+### `repo`
+
+Supply-chain defense. Point it at a GitHub URL (it clones it shallow, scans,
+then deletes it) or at a local directory, and it hunts for the tell-tale signs
+of a backdoored repo before it touches your machine or your agents:
+
+- obfuscated `eval`/`exec` (base64/hex blobs)
+- download-and-execute (`curl | sh`) and reverse shells
+- webhook exfiltration (Discord/Slack/Telegram) and env-var theft
+- crypto miners, persistence mechanisms, setuid escalation
+- malicious `preinstall`/`postinstall`/`install` hooks
+- typosquatted dependencies and repo names (edit-distance vs popular packages)
+
+```bash
+python3 vanguard.py repo https://github.com/someone/some-repo
+python3 vanguard.py repo ./local-checkout
+```
+
+Returns a verdict — `clean`, `suspicious`, or `MALICIOUS` — with file, line
+and reason for every finding. Scan before you `git clone` or `npm install`.
+
+> Note: VANGUARD's own source contains its detection signatures, so scanning
+> this repo will flag those strings — that's the tool recognizing its own
+> rules, not malware.
 
 ## How it works
 
