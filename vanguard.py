@@ -92,8 +92,15 @@ SHELL_TAMPER = REVERSE_SHELL + [
 ]
 
 # Secrets an AI agent config should never hold in plaintext (for `ai` scan).
+# Provider-specific key shapes first; the generic `sk-` catch-all last.
 SECRET_PATTERNS = [
-    (re.compile(r"(sk-[A-Za-z0-9]{20,})"), "OpenAI-style API key"),
+    (re.compile(r"(sk-ant-[A-Za-z0-9_-]{20,})"), "Anthropic API key"),
+    (re.compile(r"(AIza[0-9A-Za-z_-]{30,})"), "Google AI (Gemini) key"),
+    (re.compile(r"(sk-or-[A-Za-z0-9-]{20,})"), "OpenRouter key"),
+    (re.compile(r"(gsk_[A-Za-z0-9]{20,})"), "Groq key"),
+    (re.compile(r"(xai-[A-Za-z0-9]{20,})"), "xAI key"),
+    (re.compile(r"(hf_[A-Za-z0-9]{20,})"), "Hugging Face token"),
+    (re.compile(r"(sk-[A-Za-z0-9]{20,})"), "DeepSeek/OpenAI-compatible API key"),
     (re.compile(r"(AKIA[0-9A-Z]{16})"), "AWS access key"),
     (re.compile(r"(-----BEGIN [A-Z ]*PRIVATE KEY-----)"), "PEM private key"),
     (re.compile(r"(ghp_[A-Za-z0-9]{30,})"), "GitHub PAT"),
@@ -104,8 +111,16 @@ SECRET_PATTERNS = [
 ]
 
 AI_AGENT_DIRS = [
+    # agents
     "~/.hermes", "~/.claude", "~/.codex", "~/.cursor", "~/.opencode",
     "~/.config/opencode", "~/.gemini", "~/.copilot", "~/.windsurf",
+    "~/Library/Application Support/Claude", "~/Library/Application Support/Cursor",
+    "~/Library/Application Support/Code/User",
+    # API providers
+    "~/.deepseek", "~/.config/deepseek", "~/.openai", "~/.anthropic",
+    "~/.openrouter", "~/.config/openrouter", "~/.groq", "~/.mistral",
+    "~/.cohere", "~/.config/cohere", "~/.ollama", "~/.lmstudio",
+    "~/.aider", "~/.continue", "~/.huggingface",
 ]
 
 # Tool-call policy: command fragments a local/AI guard should flag or block.
@@ -404,7 +419,7 @@ def guard(interval=30, once=False):
 
 def ai_secret_scan():
     hits = []
-    SKIP = ["node_modules", "/openssl/", "/include/", ".git", ".DS_Store", "fipskey", "__pycache__"]
+    SKIP = ["node_modules", "/openssl/", "/include/", ".git", ".DS_Store", "fipskey", "__pycache__", "tools/", "site-packages"]
     for d in AI_AGENT_DIRS:
         base = Path(d).expanduser()
         if not base.exists():

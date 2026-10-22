@@ -108,6 +108,11 @@ python3 vanguard.py ai --text "..."     # prompt-injection check
 python3 vanguard.py ai --tool "..."     # tool-call policy verdict
 ```
 
+Covers every agent and every API: Hermes, Claude Code, Codex, Cursor,
+OpenCode, Gemini CLI, Copilot, Windsurf — and DeepSeek, OpenAI, Anthropic,
+Google (Gemini), OpenRouter, Groq, Mistral, xAI, Cohere, Ollama, LM Studio,
+Hugging Face, and any OpenAI-compatible endpoint.
+
 ### `php`
 
 Checks `php --version` against the known 2026 CVEs and prints the ones your
