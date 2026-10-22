@@ -9,17 +9,24 @@ Commands:
   guard     continuous monitor — alert on new suspicious activity
   ai        defend AI agents (secret leak scan + prompt-injection check + tool policy)
   php       check the local PHP install against known 2026 CVEs
+  web       website fortress (audit a site / run the reverse-proxy WAF)
+  net       self network audit (listening services)
 """
 import argparse
+import http.server
 import json
 import os
 import platform
 import re
 import shutil
 import socket
+import socketserver
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 VERSION = "1.0.0"
@@ -109,6 +116,44 @@ DANGEROUS_TOOLS = [
     (re.compile(r"chmod\s+-R\s+777\s+/"), "world-writable system tree"),
     (re.compile(r"git\s+push.*--force"), "force push"),
 ]
+
+# --- Web attack signatures (for the website shield / audit) ---
+WEB_ATTACK = [
+    (re.compile(r"(\bunion\b.+\bselect\b|\bselect\b.+\bfrom\b.+\binformation_schema\b|\bpg_sleep\b|\bsleep\s*\()", re.I), "SQL injection"),
+    (re.compile(r"(<\s*script|javascript:|onerror\s*=|onclick\s*=|onload\s*=|alert\s*\(|</?script)", re.I), "XSS"),
+    (re.compile(r"(\.\./\.\./|%2e%2e|\.\.%2f|%252e%252e|\.\.\\\.\.\\)", re.I), "path traversal"),
+    (re.compile(r"(/etc/passwd|/etc/shadow|win\.ini|boot\.ini|\.ssh/id_rsa)", re.I), "LFI / sensitive file"),
+    (re.compile(r"(\$\{[^}]*\}|\{\{[^}]*\}\}|<%=|%7b%7b)", re.I), "SSTI"),
+    (re.compile(r"([;&|]\s*(cat|ls|whoami|id|wget|curl|bash|sh|nc|ncat|uname|ifconfig|ipconfig)\b)", re.I), "command injection"),
+    (re.compile(r"(php://(filter|input)|expect://|file://|glob://|data://text)", re.I), "PHP wrapper injection"),
+    (re.compile(r"(base64_decode\s*\(\s*\$_(GET|POST|REQUEST)|eval\s*\(\s*\$_(GET|POST|REQUEST)|assert\s*\(\s*\$_(GET|POST|REQUEST)|shell_exec\s*\(\s*\$_(GET|POST|REQUEST)|system\s*\(\s*\$_(GET|POST|REQUEST))", re.I), "PHP code injection"),
+    (re.compile(r"(<\?php|<\?=)", re.I), "PHP tag injection"),
+    (re.compile(r"(java\.lang\.Runtime|ProcessBuilder|getRuntime\s*\(\s*\)\.exec)", re.I), "Java RCE"),
+    (re.compile(r"(select\s+pg_sleep|waitfor\s+delay|benchmark\s*\()", re.I), "blind SQLi"),
+    (re.compile(r"(curl|wget|nc|ncat)[^a-z].*\|\s*(sh|bash)", re.I), "piped reverse shell"),
+]
+
+SECURITY_HEADERS = [
+    "strict-transport-security",
+    "content-security-policy",
+    "x-frame-options",
+    "x-content-type-options",
+    "referrer-policy",
+    "permissions-policy",
+]
+
+EXPOSED_PATHS = [
+    "/.git/HEAD", "/.git/config", "/.env", "/phpinfo.php", "/info.php",
+    "/backup.zip", "/backup.tar.gz", "/.DS_Store", "/server-status",
+    "/wp-config.php.bak", "/.htaccess", "/.aws/credentials", "/id_rsa",
+]
+
+# Open services that are dangerous to expose on a public interface.
+DANGEROUS_SERVICES = {
+    23: "telnet", 21: "ftp", 3306: "mysql", 6379: "redis", 9200: "elasticsearch",
+    27017: "mongodb", 5432: "postgresql", 2375: "docker (unauthenticated)",
+    11211: "memcached", 5900: "vnc", 3389: "rdp", 22: "ssh", 5985: "winrm",
+}
 
 
 def _run(cmd, timeout=15):
@@ -411,6 +456,123 @@ def do_ai(args):
 
 
 # ----------------------------------------------------------------------------
+# web (website fortress)
+# ----------------------------------------------------------------------------
+
+def web_audit(url):
+    if not url.startswith("http"):
+        url = "https://" + url
+    report = {"url": url, "headers": {}, "missing_headers": [], "exposed": []}
+    try:
+        req = urllib.request.Request(url, method="GET", headers={"User-Agent": "VANGUARD/1.0"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            report["status"] = resp.status
+            for k, v in resp.headers.items():
+                report["headers"][k.lower()] = v
+    except Exception as e:
+        report["error"] = str(e)
+        return report
+
+    for h in SECURITY_HEADERS:
+        if h not in report["headers"]:
+            report["missing_headers"].append(h)
+    if "server" in report["headers"]:
+        report["server_header"] = report["headers"]["server"]
+    if url.startswith("http://"):
+        report["tls"] = "NO — plain HTTP"
+
+    base = url.rstrip("/")
+    for path in EXPOSED_PATHS:
+        try:
+            r = urllib.request.Request(base + path, method="GET", headers={"User-Agent": "VANGUARD/1.0"})
+            with urllib.request.urlopen(r, timeout=8) as resp:
+                report["exposed"].append({"path": path, "status": resp.status})
+        except urllib.error.HTTPError as e:
+            if e.code not in (404, 410):
+                report["exposed"].append({"path": path, "status": e.code, "note": "exists (non-404)"})
+        except Exception:
+            pass
+    return report
+
+
+def web_shield(upstream, port=8080):
+    """Reverse-proxy WAF: sits in front of a site and blocks attack payloads."""
+    upstream = upstream.rstrip("/")
+
+    class Shield(http.server.BaseHTTPRequestHandler):
+        def _handle(self):
+            raw = self.path
+            body = b""
+            clen = self.headers.get("Content-Length")
+            if clen and clen.isdigit():
+                body = self.rfile.read(int(clen))
+            raw += "\n" + str(self.headers) + "\n" + body.decode("utf-8", "ignore")
+
+            for pat, why in WEB_ATTACK:
+                if pat.search(raw):
+                    self.log_message("BLOCKED [%s] %s", why, self.path)
+                    self.send_response(403)
+                    self.send_header("Content-Type", "text/plain")
+                    self.end_headers()
+                    self.wfile.write(b"403 Forbidden - blocked by VANGUARD\n")
+                    return
+
+            fwd = {k: v for k, v in self.headers.items() if k.lower() not in ("host", "content-length", "connection")}
+            fwd["Host"] = urllib.parse.urlparse(upstream).netloc
+            try:
+                req = urllib.request.Request(upstream + self.path, data=body or None, method=self.command, headers=fwd)
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    data = resp.read()
+                    self.send_response(resp.status)
+                    for k, v in resp.headers.items():
+                        if k.lower() not in ("transfer-encoding", "connection", "content-length"):
+                            self.send_header(k, v)
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+            except Exception as e:
+                self.log_message("UPSTREAM ERROR: %s", e)
+                self.send_response(502)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b"502 Bad Gateway\n")
+
+        def do_GET(self): self._handle()
+        def do_POST(self): self._handle()
+        def do_PUT(self): self._handle()
+        def do_DELETE(self): self._handle()
+        def do_HEAD(self): self._handle()
+        def do_OPTIONS(self): self._handle()
+        def log_message(self, fmt, *args):
+            print("[%s] %s" % (time.strftime("%H:%M:%S"), fmt % args), flush=True)
+
+    class Reuse(socketserver.ThreadingTCPServer):
+        allow_reuse_address = True
+
+    print(f"VANGUARD shield listening: http://127.0.0.1:{port}  ->  {upstream}")
+    print("Forward this to your site instead of exposing the origin directly.")
+    with Reuse(("127.0.0.1", port), Shield) as srv:
+        try:
+            srv.serve_forever()
+        except KeyboardInterrupt:
+            print("\nshield stopped")
+
+
+def net_audit():
+    """Self network audit: what is listening, and whether any are dangerous."""
+    hits = []
+    out, _, _ = _run("lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null" if IS_MAC else "ss -tlnp 2>/dev/null || netstat -tlnp 2>/dev/null")
+    for line in out.splitlines():
+        m = re.search(r":(\d+)\s", line)
+        if not m:
+            continue
+        port = int(m.group(1))
+        if port in DANGEROUS_SERVICES:
+            hits.append({"port": port, "service": DANGEROUS_SERVICES[port], "line": line.strip()[:140]})
+    return {"listening": len(out.splitlines()), "dangerous_services": hits}
+
+
+# ----------------------------------------------------------------------------
 # CLI
 # ----------------------------------------------------------------------------
 
@@ -435,6 +597,16 @@ def main():
 
     sub.add_parser("php", help="check local PHP against known CVEs")
 
+    web = sub.add_parser("web", help="website fortress")
+    web_sub = web.add_subparsers(dest="web_cmd", required=True)
+    wa = web_sub.add_parser("audit", help="audit a website's security posture")
+    wa.add_argument("url")
+    ws = web_sub.add_parser("shield", help="run the reverse-proxy WAF in front of a site")
+    ws.add_argument("upstream")
+    ws.add_argument("--port", type=int, default=8080)
+
+    sub.add_parser("net", help="self network audit (listening services)")
+
     args = p.parse_args()
 
     if args.cmd == "scan":
@@ -458,6 +630,13 @@ def main():
             print("\nstopped")
     elif args.cmd == "ai":
         print(json.dumps(do_ai(args), indent=2))
+    elif args.cmd == "web":
+        if args.web_cmd == "audit":
+            print(json.dumps(web_audit(args.url), indent=2))
+        elif args.web_cmd == "shield":
+            web_shield(args.upstream, args.port)
+    elif args.cmd == "net":
+        print(json.dumps(net_audit(), indent=2))
 
 
 if __name__ == "__main__":

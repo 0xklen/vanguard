@@ -17,11 +17,15 @@
 
 ---
 
-VANGUARD is a zero-dependency guardian that watches your machine and your
-agents, and acts as the forward guard against the exploits that keep showing
-up — the October 2026 PHP memory-corruption and object-injection wave, plus
-the standing catalog of local compromise: reverse shells, webshells, miners,
-launch-agent persistence, shell-profile tampering, and AI prompt injection.
+VANGUARD is a zero-dependency fortress that guards your local machine, your
+websites, and your AI agents — at all times, against the exploits live right
+now and the ones that ship next week. It covers the whole surface, not one
+product: the October 2026 PHP memory-corruption and object-injection wave,
+the standing catalog of local compromise (reverse shells, webshells, miners,
+launch-agent persistence, shell-profile tampering), the web attack families
+(SQLi, XSS, path traversal, SSTI, command injection, PHP object injection,
+wrapper/SSRF schemes), and the AI layer (prompt injection, secret leakage,
+dangerous tool calls).
 
 It does not phone home, ships no telemetry, and needs no network to run.
 
@@ -39,6 +43,9 @@ python3 vanguard.py ai            # scan your AI agents for leaked secrets
 python3 vanguard.py ai --text "…" # check text for prompt-injection patterns
 python3 vanguard.py ai --tool "…" # check a command against the tool policy
 python3 vanguard.py php           # check local PHP against the 2026 CVEs
+python3 vanguard.py web audit URL # audit a website's security posture
+python3 vanguard.py web shield URL # run the reverse-proxy WAF in front of a site
+python3 vanguard.py net           # self network audit (listening services)
 ```
 
 No `pip install`. No compiled deps. Python 3.8+ only.
@@ -56,6 +63,9 @@ No `pip install`. No compiled deps. Python 3.8+ only.
 | **AI prompt injection** | Flags "ignore previous instructions", "reveal your system prompt", fake system/developer frames, jailbreak phrasings |
 | **AI secret leakage** | Scans `~/.hermes`, `~/.claude`, `~/.codex`, `~/.cursor` and others for plaintext API keys, private keys, PATs and JWTs |
 | **Dangerous tool calls** | Blocks `rm -rf /`, `curl \| sh`, disk wipes, `chmod -R 777 /`, force-push patterns |
+| **Web attacks** | The shield blocks SQLi, XSS, path traversal, SSTI, command injection, PHP wrappers and object injection at the door, before they reach your app |
+| **Website posture** | `web audit` checks security headers, TLS, server disclosure, and exposed sensitive paths (/.git, /.env, phpinfo, backups) |
+| **Network exposure** | `net` lists what is listening and flags dangerous open services (redis, mongo, docker, vnc, telnet, …) |
 
 ## Commands
 
@@ -102,6 +112,38 @@ python3 vanguard.py ai --tool "..."     # tool-call policy verdict
 
 Checks `php --version` against the known 2026 CVEs and prints the ones your
 install is still exposed to.
+
+### `web audit`
+
+Audits a live website: which security headers are missing (CSP, HSTS,
+X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Permissions-Policy),
+whether it's plain HTTP, what the server header leaks, and whether sensitive
+paths (/.git, /.env, phpinfo, backup archives) are reachable.
+
+```bash
+python3 vanguard.py web audit https://your-site.com
+```
+
+### `web shield`
+
+A reverse-proxy WAF you run in front of a site. It inspects every request —
+path, query, headers, body — against the attack catalog and returns 403 for
+anything malicious before it ever reaches your app, then relays the rest.
+
+```bash
+python3 vanguard.py web shield http://127.0.0.1:3000 --port 8080
+# point DNS/load-balancer at 8080 instead of exposing the origin
+```
+
+### `net`
+
+Self network audit — lists what is listening on this machine and flags any
+dangerous service that should never be reachable (redis, mongodb, docker
+without auth, vnc, telnet, …).
+
+```bash
+python3 vanguard.py net
+```
 
 ## How it works
 
